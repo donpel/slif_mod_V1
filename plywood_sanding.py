@@ -1,335 +1,169 @@
 """
-Dynamic model, simulation, and benchmarking toolkit for plywood edge sanding.
-Implements a four-state ODE with helper utilities for scenario sweeps and plotting.
+Experimental plywood sanding analysis and simple regression-based simulation.
+
+The script builds a pandas DataFrame from provided belt sanding experiments,
+fits a linear model for material removal rate (MRR) versus normal force,
+plots relationships, and simulates removal for new force scenarios.
 """
 from __future__ import annotations
 
-import itertools
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple
+import math
+from typing import Tuple
 
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.integrate import solve_ivp
 
-# Use non-interactive backend for safer script execution.
+# Use non-interactive backend so the script can run headless and save PNGs.
 matplotlib.use("Agg")
 
 
-@dataclass
-class ModelParameters:
-    """Model parameter container with modest default values."""
+def create_experiment_dataframe() -> pd.DataFrame:
+    """Create DataFrame with experimental data and derived columns."""
 
-    k_m: float = 0.08
-    a_p: float = 1.0
-    a_v: float = 0.4
+    data = [
+        {"weight_g": 451, "time_s": 54, "Ft_N": 1.578082192, "FN_N": 4.42431, "speed_mm_min": 5.555555556},
+        {"weight_g": 1100, "time_s": 28, "Ft_N": 6.575342466, "FN_N": 10.791, "speed_mm_min": 10.71428571},
+        {"weight_g": 1400, "time_s": 23, "Ft_N": 8.153424658, "FN_N": 13.734, "speed_mm_min": 13.04347826},
+        {"weight_g": 1915, "time_s": 16, "Ft_N": 9.468493151, "FN_N": 18.78615, "speed_mm_min": 18.75},
+        {"weight_g": 2212, "time_s": 13, "Ft_N": 14.72876712, "FN_N": 21.69972, "speed_mm_min": 23.07692308},
+        {"weight_g": 5000, "time_s": 6, "Ft_N": 29.19452055, "FN_N": 49.05, "speed_mm_min": 50.0},
+    ]
 
-    k_T: float = 25.0
-    T_env: float = 20.0
-    tau_T: float = 1.6
+    df = pd.DataFrame(data)
 
-    k_w: float = 0.6
+    # Derived metrics.
+    df["MRR_mm_per_min"] = 5.0 / df["time_s"] * 60.0
+    df["MRR_mm_per_s"] = df["MRR_mm_per_min"] / 60.0
+    df["ratio_Ft_to_FN"] = df["Ft_N"] / df["FN_N"]
 
-    k_R: float = 4.5
-    gamma_W: float = 0.6
-    tau_R: float = 0.8
-
-    grit_ref: float = 120.0
-    n_grit_m: float = 0.35
-    n_grit_T: float = 0.1
-    n_grit_R: float = 0.9
-
-    n_hard_T: float = 0.35
-    n_hard_R: float = 0.25
+    return df
 
 
-@dataclass
-class Inputs:
-    """Input operating conditions for a simulation run."""
+def fit_mrr_vs_FN(df: pd.DataFrame) -> Tuple[float, float, float]:
+    """Fit linear model MRR = a * FN + b and return coefficients and R^2."""
 
-    theta_deg: float
-    pressure: float
-    v_rel: float
-    hardness: float
-    grit: float
+    x = df["FN_N"].to_numpy()
+    y = df["MRR_mm_per_min"].to_numpy()
+    a, b = np.polyfit(x, y, 1)
+    y_pred = a * x + b
 
+    ss_res = np.sum((y - y_pred) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
 
-def f_theta_m(theta_deg: float) -> float:
-    """Angle influence on material interactions."""
-
-    rad = np.deg2rad(theta_deg)
-    cos_val = np.cos(rad)
-    cos_val = np.clip(cos_val, 1e-3, None)
-    return 1.0 / cos_val
+    return float(a), float(b), float(r2)
 
 
-def f_grit_m(grit: float, p: ModelParameters) -> float:
-    return (p.grit_ref / grit) ** p.n_grit_m
+def plot_mrr_vs_FN(df: pd.DataFrame, a: float, b: float, filename: str = "mrr_vs_FN.png") -> None:
+    """Scatter plot of MRR vs FN with fitted line."""
+
+    plt.figure(figsize=(7, 5))
+    plt.scatter(df["FN_N"], df["MRR_mm_per_min"], color="tab:blue", label="Experiment")
+
+    x_line = np.linspace(df["FN_N"].min() * 0.9, df["FN_N"].max() * 1.1, 200)
+    y_line = a * x_line + b
+    plt.plot(x_line, y_line, color="tab:red", label=f"Fit: MRR = {a:.3f} * FN + {b:.3f}")
+
+    plt.xlabel("Normal force FN [N]")
+    plt.ylabel("MRR [mm/min]")
+    plt.title("Material removal rate vs normal force")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(filename, dpi=150)
 
 
-def f_grit_T(grit: float, p: ModelParameters) -> float:
-    return (p.grit_ref / grit) ** p.n_grit_T
+def plot_Ft_vs_FN(df: pd.DataFrame, filename: str = "Ft_vs_FN.png") -> None:
+    """Scatter plot of cutting force vs normal force."""
+
+    plt.figure(figsize=(7, 5))
+    plt.scatter(df["FN_N"], df["Ft_N"], color="tab:green", label="Experiment")
+    plt.xlabel("Normal force FN [N]")
+    plt.ylabel("Tangential force Ft [N]")
+    plt.title("Cutting force vs normal force")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(filename, dpi=150)
 
 
-def f_grit_R(grit: float, p: ModelParameters) -> float:
-    return (grit / p.grit_ref) ** p.n_grit_R
+def plot_ratio_vs_FN(df: pd.DataFrame, filename: str = "ratio_vs_FN.png") -> None:
+    """Scatter plot of force ratio vs normal force with mean line."""
+
+    plt.figure(figsize=(7, 5))
+    plt.scatter(df["FN_N"], df["ratio_Ft_to_FN"], color="tab:purple", label="Ft/FN")
+    mean_ratio = df["ratio_Ft_to_FN"].mean()
+    plt.axhline(mean_ratio, color="tab:orange", linestyle="--", label=f"Mean ratio = {mean_ratio:.3f}")
+    plt.xlabel("Normal force FN [N]")
+    plt.ylabel("Ft / FN [-]")
+    plt.title("Force ratio vs normal force")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(filename, dpi=150)
 
 
-def f_wood_m(hardness: float) -> float:
-    hardness = np.clip(hardness, 1e-3, None)
-    return 1.0 / hardness
+def simulate_scenario(a: float, b: float) -> None:
+    """Simulate sanding removal for specified normal forces using fitted model."""
+
+    h_edge_mm = 11.0
+    L_contact_mm = 100.0
+    h_edge_cm = h_edge_mm / 10.0
+    L_contact_cm = L_contact_mm / 10.0
+    A_contact_cm2 = h_edge_cm * L_contact_cm
+
+    t_sim = 30.0  # seconds
+    FN_cases = [18.78615, 21.69972]
+
+    print("\nSimulation results (30 s) using fitted MRR = a * FN + b:")
+    for FN_sim in FN_cases:
+        mrr_sim_mm_min = a * FN_sim + b
+        mrr_sim_mm_s = mrr_sim_mm_min / 60.0
+        z_sim_mm = mrr_sim_mm_s * t_sim
+        z_sim_cm = z_sim_mm / 10.0
+        V_sim_cm3 = A_contact_cm2 * z_sim_cm
+        m_sim_g = V_sim_cm3 * 0.68  # density
+
+        print(f"\nFN = {FN_sim:.5f} N")
+        print(f"  MRR_sim = {mrr_sim_mm_min:.3f} mm/min ({mrr_sim_mm_s:.4f} mm/s)")
+        print(f"  Removed thickness after {t_sim:.0f} s: {z_sim_mm:.3f} mm")
+        print(f"  Removed volume: {V_sim_cm3:.3f} cm^3")
+        print(f"  Removed mass (rho=0.68 g/cm^3): {m_sim_g:.3f} g")
+
+        # Optional comparison to experimental value if available.
+        matching_row = None
+        if math.isclose(FN_sim, 18.78615, rel_tol=1e-6):
+            matching_row = 18.78615
+        elif math.isclose(FN_sim, 21.69972, rel_tol=1e-6):
+            matching_row = 21.69972
+
+        if matching_row is not None:
+            exp_table = create_experiment_dataframe()
+            exp_row = exp_table.loc[np.isclose(exp_table["FN_N"], matching_row)].iloc[0]
+            mrr_exp = float(exp_row["MRR_mm_per_min"])
+            abs_err = mrr_sim_mm_min - mrr_exp
+            rel_err = abs_err / mrr_exp if mrr_exp != 0 else float("nan")
+            print(f"  Experimental MRR: {mrr_exp:.3f} mm/min")
+            print(f"  Error: {abs_err:.3f} mm/min ({rel_err:.1%})")
 
 
-def f_wood_T(hardness: float, p: ModelParameters) -> float:
-    hardness = np.clip(hardness, 1e-3, None)
-    return hardness ** p.n_hard_T
+def main():
+    df = create_experiment_dataframe()
+    print("Experimental data with derived columns:")
+    print(df.to_string(index=False))
 
+    a, b, r2 = fit_mrr_vs_FN(df)
+    print(f"\nFitted MRR = a * FN + b: a = {a:.4f}, b = {b:.4f}, R^2 = {r2:.4f}")
 
-def f_wood_R(hardness: float, p: ModelParameters) -> float:
-    hardness = np.clip(hardness, 1e-3, None)
-    return hardness ** p.n_hard_R
+    plot_mrr_vs_FN(df, a, b)
+    plot_Ft_vs_FN(df)
+    plot_ratio_vs_FN(df)
+    print("Saved plots: mrr_vs_FN.png, Ft_vs_FN.png, ratio_vs_FN.png")
 
-
-def plywood_sanding_ode(t: float, x: np.ndarray, u: Inputs, p: ModelParameters) -> List[float]:
-    """Four-state ODE describing plywood edge sanding."""
-
-    z, T, W, Ra = x
-
-    dzdt = (
-        p.k_m
-        * u.pressure ** p.a_p
-        * u.v_rel ** p.a_v
-        * f_theta_m(u.theta_deg)
-        * f_grit_m(u.grit, p)
-        * f_wood_m(u.hardness)
-        * (1.0 - W)
-    )
-
-    dTdt = (
-        p.k_T
-        * u.pressure
-        * u.v_rel
-        * f_theta_m(u.theta_deg)
-        * f_grit_T(u.grit, p)
-        * f_wood_T(u.hardness, p)
-        * (1.0 - W)
-        - (T - p.T_env) / p.tau_T
-    )
-
-    dWdt = p.k_w * abs(dzdt)
-    if W >= 1.0 and dWdt > 0.0:
-        dWdt = 0.0
-
-    Ra_ss = (
-        p.k_R
-        * f_grit_R(u.grit, p)
-        * f_theta_m(u.theta_deg)
-        * f_wood_R(u.hardness, p)
-        * (1.0 + p.gamma_W * W)
-    )
-    dRadt = -(Ra - Ra_ss) / p.tau_R
-
-    return [dzdt, dTdt, dWdt, dRadt]
-
-
-def get_default_parameters() -> ModelParameters:
-    return ModelParameters()
-
-
-def run_simulation(
-    u: Inputs,
-    p: ModelParameters,
-    x0: Iterable[float],
-    t_span: Tuple[float, float],
-    t_eval: np.ndarray | None = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Integrate the sanding model and return time vector and state history."""
-
-    if t_eval is None:
-        t_eval = np.linspace(t_span[0], t_span[1], 200)
-
-    sol = solve_ivp(
-        lambda t, x: plywood_sanding_ode(t, x, u, p),
-        t_span=t_span,
-        y0=np.array(x0, dtype=float),
-        t_eval=t_eval,
-        method="RK45",
-    )
-    if not sol.success:
-        raise RuntimeError(f"Integration failed: {sol.message}")
-
-    return sol.t, sol.y
-
-
-def run_scenario_grid(
-    angles: Iterable[float],
-    grits: Iterable[float],
-    pressures: Iterable[float],
-    hardness_values: Iterable[float],
-    p: ModelParameters,
-    t_span: Tuple[float, float] = (0.0, 5.0),
-    x0: Iterable[float] = (0.0, 20.0, 0.0, 8.0),
-) -> pd.DataFrame:
-    """Run simulations for all scenario combinations and summarize results."""
-
-    records: List[Dict[str, float]] = []
-    for theta_deg, grit, pressure, hardness in itertools.product(
-        angles, grits, pressures, hardness_values
-    ):
-        u = Inputs(theta_deg=theta_deg, pressure=pressure, v_rel=15.0, hardness=hardness, grit=grit)
-        t, y = run_simulation(u, p, x0, t_span)
-        z, T, W, Ra = y
-        duration = t_span[1] - t_span[0]
-        records.append(
-            {
-                "theta_deg": theta_deg,
-                "grit": grit,
-                "pressure": pressure,
-                "hardness": hardness,
-                "z_final": float(z[-1]),
-                "Ra_final": float(Ra[-1]),
-                "T_max": float(T.max()),
-                "W_final": float(min(W[-1], 1.0)),
-                "mrr_avg": float(z[-1] / duration),
-            }
-        )
-
-    return pd.DataFrame.from_records(records)
-
-
-def plot_time_series(t: np.ndarray, y: np.ndarray, title: str = "Sanding simulation", save_path: str | None = None):
-    """Plot time evolution of all state variables."""
-
-    labels = ["z [mm]", "T [°C]", "W [-]", "Ra [µm]"]
-    fig, axes = plt.subplots(2, 2, figsize=(10, 6), sharex=True)
-    axes = axes.flatten()
-    for ax, data, label in zip(axes, y, labels):
-        ax.plot(t, data, lw=2)
-        ax.set_ylabel(label)
-        ax.grid(True, alpha=0.3)
-    axes[-2].set_xlabel("Time [s]")
-    axes[-1].set_xlabel("Time [s]")
-    fig.suptitle(title)
-    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
-    if save_path:
-        fig.savefig(save_path, dpi=150)
-    return fig, axes
-
-
-def plot_grid_summary(df: pd.DataFrame, value_col: str, title: str, save_path: str | None = None):
-    """Visualize aggregated metric as grouped bars."""
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    grouped = df.groupby(["theta_deg", "grit"])[value_col].mean().unstack()
-    grouped.plot(kind="bar", ax=ax)
-    ax.set_ylabel(value_col)
-    ax.set_title(title)
-    ax.grid(True, axis="y", alpha=0.3)
-    ax.legend(title="Grit")
-    fig.tight_layout()
-    if save_path:
-        fig.savefig(save_path, dpi=150)
-    return fig, ax
-
-
-benchmark_data = [
-    {
-        "name": "birch_plywood_P120_45deg_medium_pressure",
-        "theta_deg": 45,
-        "grit": 120,
-        "pressure": 0.8,
-        "v_rel": 15.0,
-        "hardness": 0.7,
-        "expected_Ra_range": (3.0, 5.0),
-        "expected_MRR_range": (0.05, 0.2),
-    },
-    {
-        "name": "softwood_P80_0deg_low_pressure",
-        "theta_deg": 0,
-        "grit": 80,
-        "pressure": 0.3,
-        "v_rel": 15.0,
-        "hardness": 0.4,
-        "expected_Ra_range": (4.0, 7.0),
-        "expected_MRR_range": (0.06, 0.18),
-    },
-]
-
-
-def compare_with_benchmarks(sim_results_df: pd.DataFrame, benchmarks: List[Dict]) -> pd.DataFrame:
-    """Compare simulation outputs with simple benchmark ranges."""
-
-    reports: List[Dict[str, object]] = []
-    for bench in benchmarks:
-        mask = (
-            (sim_results_df["theta_deg"] == bench["theta_deg"]) &
-            (sim_results_df["grit"] == bench["grit"]) &
-            (sim_results_df["pressure"] == bench["pressure"]) &
-            (sim_results_df["hardness"] == bench["hardness"])
-        )
-        matches = sim_results_df[mask]
-        if matches.empty:
-            reports.append({"name": bench["name"], "status": "no_match"})
-            continue
-
-        row = matches.iloc[0]
-        z_rate = row["mrr_avg"]
-        Ra_final = row["Ra_final"]
-        mrr_min, mrr_max = bench["expected_MRR_range"]
-        ra_min, ra_max = bench["expected_Ra_range"]
-        reports.append(
-            {
-                "name": bench["name"],
-                "mrr_within": mrr_min <= z_rate <= mrr_max,
-                "Ra_within": ra_min <= Ra_final <= ra_max,
-                "mrr_avg": z_rate,
-                "Ra_final": Ra_final,
-                "z_final": row["z_final"],
-                "T_max": row["T_max"],
-                "W_final": row["W_final"],
-            }
-        )
-
-    return pd.DataFrame(reports)
-
-
-def demo_single_run():
-    """Run a representative single simulation and produce plots."""
-
-    p = get_default_parameters()
-    u = Inputs(theta_deg=45.0, pressure=0.8, v_rel=15.0, hardness=0.7, grit=120.0)
-    t_span = (0.0, 5.0)
-    x0 = (0.0, p.T_env, 0.0, 8.0)
-    t, y = run_simulation(u, p, x0, t_span)
-    plot_time_series(t, y, title="Single sanding scenario", save_path="single_run.png")
-    print("Saved single scenario plot to single_run.png")
-
-
-def demo_grid_and_benchmark():
-    """Run a grid sweep and benchmark comparison."""
-
-    p = get_default_parameters()
-    df = run_scenario_grid(
-        angles=[0, 45, 90],
-        grits=[80, 120, 180],
-        pressures=[0.3, 0.8, 1.5],
-        hardness_values=[0.4, 0.7, 0.9],
-        p=p,
-    )
-    print(df.head())
-    df.to_csv("scenario_summary.csv", index=False)
-    print("Saved scenario summary to scenario_summary.csv")
-    plot_grid_summary(df, value_col="Ra_final", title="Final Ra vs angle and grit", save_path="grid_ra.png")
-    print("Saved grid summary plot to grid_ra.png")
-
-    bench_report = compare_with_benchmarks(df, benchmark_data)
-    print("Benchmark comparison:")
-    print(bench_report)
-    bench_report.to_csv("benchmark_report.csv", index=False)
+    simulate_scenario(a, b)
 
 
 if __name__ == "__main__":
-    demo_single_run()
-    demo_grid_and_benchmark()
+    main()
